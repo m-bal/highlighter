@@ -1,3 +1,47 @@
+# Adversarial Review Package - Round 1
+**Date**: 2026-01-05
+**VDD Phase**: Initial Adversarial Review
+
+---
+
+## Instructions for Adversarial Reviewer
+
+You are a hyper-critical code reviewer with zero patience for sloppy code, lazy patterns, or unhandled edge cases. Your job is to tear this code apart and find every flaw, weakness, and potential failure point. Do not be polite. Do not assume good intentions. Assume the worst and find it.
+
+### Specific Focus Areas
+- Unhandled edge cases and error conditions
+- Performance inefficiencies and code smell
+- Security vulnerabilities
+- Incomplete or misleading documentation
+- Logic gaps and hidden assumptions
+- Technical debt and maintainability issues
+- Incorrect use of APIs
+- Race conditions and concurrency issues
+- Memory leaks or resource management problems
+
+---
+
+## Project Context
+
+**Name**: highlighter.nvim
+**Purpose**: A Neovim plugin for visually highlighting text selections with colors
+**Language**: Rust + Neovim Lua integration
+**Framework**: nvim-oxi (Rust bindings for Neovim API)
+
+### Core Functionality
+1. User selects text in Visual mode
+2. Presses `<C-h>` to trigger highlighter
+3. Selects a color from a picker UI
+4. Plugin creates extmarks with appropriate priority to render highlights
+5. User can clear all highlights with `<leader>ch`
+
+---
+
+## Code Under Review
+
+### File: src/lib.rs (Complete Source)
+
+```rust
 use lazy_static;
 
 use std::collections::HashMap;
@@ -247,3 +291,128 @@ fn test_clear_command_on_empty_buffer() -> Result<(), api::Error> {
     assert!(result.is_ok(), "Clear should succeed on empty buffer");
     Ok(())
 }
+```
+
+---
+
+## Pre-Identified Issues (Do NOT limit yourself to these)
+
+From initial code review, the following issues are OBVIOUS:
+
+1. **Panic City**: `.unwrap()` and `.expect()` everywhere - 18+ instances
+2. **Priority Overflow**: `let new_priority = highest_line_priority(row, start, end) + 1;` - What happens at u32::MAX?
+3. **Magic Number**: `let mut max_priority: u32 = 200;` - Why 200? What if existing extmarks have priority > 200?
+4. **Namespace Confusion**: `clear()` uses namespace `0` instead of `*PLUGIN`
+5. **Unused Return**: `let _ = api::get_current_buf().set_extmark(...)` - Silently ignoring potential errors
+6. **Typo in Debug**: `oxi::dbg!("Clearing LIne");` - "LIne" typo
+7. **No Validation**: `choice: String` parameter not validated against COLORS
+8. **Range Issue**: `clear_namespace(*PLUGIN, row..=row + 1)` - Why `row + 1`? Potential off-by-one?
+9. **Double Return**: `return max_priority;` after early return in `highest_line_priority`
+10. **Visual Mark Assumptions**: Assumes `<` and `>` marks always exist and are valid
+
+### Questions to Answer with Extreme Prejudice
+
+1. What happens if the buffer is closed while highlighting?
+2. What happens with UTF-8 multi-byte characters? Does `.len()` give byte or char count?
+3. What if `visual_col_end < visual_col_start`?
+4. What if the user cancels the color picker?
+5. What if Neovim doesn't support the required API version?
+6. Is there a memory leak with extmarks never being garbage collected?
+7. What if another plugin uses the same keybindings?
+8. What if the buffer is read-only?
+9. What if `row + 1` in `clear_line` exceeds buffer line count?
+10. What's the behavior with folded text?
+
+---
+
+## Build System
+
+### make.sh
+```bash
+#!/bin/bash
+set -e
+
+build() {
+  echo "Building silicon.nvim from source..."
+
+  cargo build --release --target-dir ./target
+
+  # Place the compiled library where Neovim can find it.
+  mkdir -p lua
+
+  if [ "$(uname)" == "Darwin" ]; then
+    mv target/release/libhighlighter.dylib lua/highlighter.so
+  elif [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then
+    mv target/release/libhighlighter.so lua/highlighter.so
+  elif [ "$(expr substr $(uname -s) 1 10)" == "MINGW64_NT" ]; then
+    mv target/release/highlighter.dll lua/highlighter.dll
+  fi
+}
+
+build
+```
+
+**Issues?**
+- Echo says "silicon.nvim" but project is "highlighter" - copy-paste error?
+- No error handling if build fails
+- `expr substr` is archaic - why not use proper bash patterns?
+- No verification that the file was actually created
+
+---
+
+## Cargo.toml
+```toml
+[package]
+name = "highlighter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lazy_static = "1.4.0"
+mlua = { version = "0.8.8", features = ["luajit52"] }
+nvim-oxi = { version = "0.2.2", features = ["neovim-0-8", "test", "mlua"] }
+```
+
+**Issues?**
+- No repository, authors, or license metadata
+- nvim-oxi 0.2.2 is ancient (2023) - are there critical bugs/security issues?
+- No dev-dependencies for testing
+- No description
+
+---
+
+## Expected Deliverables
+
+Provide a brutally honest critique in the following format:
+
+### 1. Critical Flaws (Must Fix)
+List issues that will cause data loss, panics, or security vulnerabilities.
+
+### 2. Major Issues (Should Fix)
+List issues that cause poor UX, performance problems, or maintainability nightmares.
+
+### 3. Code Smell (Consider Fixing)
+List minor issues, stylistic problems, or potential future tech debt.
+
+### 4. Architecture Concerns
+Question fundamental design decisions. Is this the right approach?
+
+### 5. Missing Functionality
+What SHOULD be here but isn't?
+
+### 6. Test Coverage Gaps
+What critical paths are not tested?
+
+### 7. Documentation Lies
+Where does the documentation claim something the code doesn't deliver?
+
+---
+
+## VDD Context
+
+This is **Round 1** of adversarial review. The code was just instrumented with basic tests. Your job is to find everything wrong so the Builder can iterate.
+
+**Remember**: Assume incompetence. Assume malice. Assume every edge case will be hit in production. Tear this apart.
