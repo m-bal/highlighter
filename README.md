@@ -145,11 +145,17 @@ This project follows **Verification-Driven Development (VDD)** methodology. See 
 
 See [VDD_HIERARCHY.md](VDD_HIERARCHY.md) for tracked issues and technical debt.
 
-### Critical Issues
-- ⚠️ Extensive use of `.unwrap()` - no graceful error handling
-- ⚠️ No handling of buffer invalidation during operations
-- ⚠️ Potential u32 priority overflow on repeated highlights
-- ⚠️ No UTF-8 multi-byte character testing
+### ✅ Recently Fixed (VDD Round 1)
+- ✅ All `.unwrap()` calls replaced with proper error handling
+- ✅ Priority overflow protection with MAX_SAFE_PRIORITY
+- ✅ Color validation before applying highlights
+- ✅ Namespace bug in clear command fixed
+- ✅ Off-by-one error in clear_line range fixed
+
+### Remaining Known Issues
+- ⚠️ UTF-8 multi-byte character positions may not align with visual columns (documented)
+- ⚠️ No configuration API for custom colors (planned in Epic 6)
+- ⚠️ No persistence of highlights across sessions (planned in Epic 6)
 
 ## Contributing
 
