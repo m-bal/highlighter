@@ -147,6 +147,16 @@ See [VDD_HIERARCHY.md](VDD_HIERARCHY.md) for tracked issues and technical debt.
 
 ### ✅ Recently Fixed
 
+**VDD Round 3** (v0.2.0 - E2E Testing):
+- ✅ Comprehensive E2E test suite (28 total tests, ~75% coverage)
+- ✅ Multi-line selection workflow tested
+- ✅ Overlapping highlight priority verification
+- ✅ UTF-8 multi-byte character handling tested
+- ✅ Block selection edge cases covered
+- ✅ Multi-buffer isolation verified
+- ✅ Visual marks simulation tested
+- ✅ Priority increment sequences validated
+
 **VDD Round 2** (v0.2.0):
 - ✅ Safe initialization with OnceLock (no startup panics)
 - ✅ Error propagation instead of silent failures

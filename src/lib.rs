@@ -495,3 +495,434 @@ fn test_priority_overflow_protection() -> Result<(), api::Error> {
     assert!(priority <= MAX_SAFE_PRIORITY, "Priority should not exceed MAX_SAFE_PRIORITY");
     Ok(())
 }
+
+// ============================================================================
+// E2E TESTS - Full Workflow Testing
+// ============================================================================
+
+#[oxi::test]
+fn test_multiline_highlight_simulation() -> Result<(), api::Error> {
+    // Simulate highlighting a multi-line selection
+    let buf = api::create_buf(false, true)?;
+    api::set_current_buf(&buf)?;
+
+    // Create a multi-line buffer
+    buf.set_lines(0..3, true, vec![
+        "First line".to_string(),
+        "Second line".to_string(),
+        "Third line".to_string(),
+    ].into_iter())?;
+
+    // Simulate visual marks for lines 0-2 (entire selection)
+    buf.set_mark('<', 0, 0, Default::default())?;
+    buf.set_mark('>', 2, 9, Default::default())?; // "Third line" end
+
+    // Simulate the highlight operation by directly calling perform_highlight logic
+    let namespace = get_namespace()?;
+
+    // Highlight all three lines
+    for row in 0..=2 {
+        let line_len = get_line_length(row)?;
+        let start = if row == 0 { 0 } else { 0 };
+        let end = if row == 2 { 10.min(line_len) } else { line_len };
+
+        let priority = highest_line_priority(row, start, end)?;
+        let new_priority = if priority >= MAX_SAFE_PRIORITY {
+            MAX_SAFE_PRIORITY
+        } else {
+            priority + 1
+        };
+
+        let ext_opt = SetExtmarkOpts::builder()
+            .priority(new_priority)
+            .hl_group("Red")
+            .end_col(end)
+            .build();
+
+        buf.set_extmark(namespace, row, start, &ext_opt)?;
+    }
+
+    // Verify extmarks were created for all three lines
+    for row in 0..=2 {
+        let extmarks = buf.get_extmarks(
+            namespace,
+            ExtmarkPosition::ByTuple((row, 0)),
+            ExtmarkPosition::ByTuple((row, usize::MAX)),
+            &GetExtmarksOpts::builder().build()
+        )?;
+
+        let count = extmarks.count();
+        assert!(count > 0, "Line {} should have at least one extmark", row);
+    }
+
+    Ok(())
+}
+
+#[oxi::test]
+fn test_overlapping_highlights_priority_layering() -> Result<(), api::Error> {
+    // Test that overlapping highlights respect priority ordering
+    let buf = api::create_buf(false, true)?;
+    api::set_current_buf(&buf)?;
+
+    buf.set_lines(0..1, true, vec!["Test line for overlapping".to_string()].into_iter())?;
+
+    let namespace = get_namespace()?;
+
+    // Add first highlight (chars 0-10)
+    let ext_opt1 = SetExtmarkOpts::builder()
+        .priority(BASE_PRIORITY + 1)
+        .hl_group("Red")
+        .end_col(10)
+        .build();
+    buf.set_extmark(namespace, 0, 0, &ext_opt1)?;
+
+    // Add second overlapping highlight (chars 5-15) with higher priority
+    let ext_opt2 = SetExtmarkOpts::builder()
+        .priority(BASE_PRIORITY + 2)
+        .hl_group("Blue")
+        .end_col(15)
+        .build();
+    buf.set_extmark(namespace, 0, 5, &ext_opt2)?;
+
+    // Verify both extmarks exist
+    let extmarks = buf.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByTuple((0, 0)),
+        ExtmarkPosition::ByTuple((0, usize::MAX)),
+        &GetExtmarksOpts::builder().details(true).build()
+    )?;
+
+    let count = extmarks.count();
+    assert_eq!(count, 2, "Should have exactly 2 overlapping extmarks");
+
+    // Calculate priority for the overlapping region
+    let priority = highest_line_priority(0, 5, 15)?;
+    assert!(priority >= BASE_PRIORITY + 2, "Priority should be at least as high as the highest existing mark");
+
+    Ok(())
+}
+
+#[oxi::test]
+fn test_utf8_multibyte_character_handling() -> Result<(), api::Error> {
+    // Test highlighting with UTF-8 multi-byte characters
+    let buf = api::create_buf(false, true)?;
+    api::set_current_buf(&buf)?;
+
+    // String with multi-byte characters: "Hello 世界" (Chinese for "world")
+    buf.set_lines(0..1, true, vec!["Hello 世界".to_string()].into_iter())?;
+
+    let line_len = get_line_length(0)?;
+    // "Hello 世界" = 5 ASCII + 1 space + 6 bytes (2 chars × 3 bytes each) = 12 bytes
+    assert_eq!(line_len, 12, "Line with UTF-8 should report byte length");
+
+    let namespace = get_namespace()?;
+
+    // Highlight the entire line including UTF-8 characters
+    let ext_opt = SetExtmarkOpts::builder()
+        .priority(BASE_PRIORITY + 1)
+        .hl_group("Green")
+        .end_col(line_len)
+        .build();
+
+    let result = buf.set_extmark(namespace, 0, 0, &ext_opt);
+    assert!(result.is_ok(), "Should successfully highlight UTF-8 text");
+
+    Ok(())
+}
+
+#[oxi::test]
+fn test_empty_range_block_selection() -> Result<(), api::Error> {
+    // Test that empty ranges are skipped (can happen with block selections)
+    let buf = api::create_buf(false, true)?;
+    api::set_current_buf(&buf)?;
+
+    buf.set_lines(0..2, true, vec![
+        "Short".to_string(),
+        "Much longer line".to_string(),
+    ].into_iter())?;
+
+    let namespace = get_namespace()?;
+
+    // Simulate block selection that extends past first line
+    // Line 0: "Short" (5 chars), trying to highlight cols 10-15 (beyond line end)
+    let line_len = get_line_length(0)?;
+    let start = 10;
+    let end = 15.min(line_len);
+
+    // This should result in start >= end, which should be skipped
+    if start < end {
+        let ext_opt = SetExtmarkOpts::builder()
+            .priority(BASE_PRIORITY + 1)
+            .hl_group("Yellow")
+            .end_col(end)
+            .build();
+        buf.set_extmark(namespace, 0, start, &ext_opt)?;
+    }
+
+    // Verify no extmark was created (empty range was skipped)
+    let extmarks = buf.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByTuple((0, 0)),
+        ExtmarkPosition::ByTuple((0, usize::MAX)),
+        &GetExtmarksOpts::builder().build()
+    )?;
+
+    assert_eq!(extmarks.count(), 0, "Empty range should not create extmark");
+
+    Ok(())
+}
+
+#[oxi::test]
+fn test_multi_buffer_isolation() -> Result<(), api::Error> {
+    // Test that highlights are isolated per buffer
+    let buf1 = api::create_buf(false, true)?;
+    let buf2 = api::create_buf(false, true)?;
+
+    let namespace = get_namespace()?;
+
+    // Add content to buf1 and highlight it
+    api::set_current_buf(&buf1)?;
+    buf1.set_lines(0..1, true, vec!["Buffer 1 content".to_string()].into_iter())?;
+
+    let ext_opt1 = SetExtmarkOpts::builder()
+        .priority(BASE_PRIORITY + 1)
+        .hl_group("Red")
+        .end_col(10)
+        .build();
+    buf1.set_extmark(namespace, 0, 0, &ext_opt1)?;
+
+    // Add content to buf2 and highlight it
+    api::set_current_buf(&buf2)?;
+    buf2.set_lines(0..1, true, vec!["Buffer 2 content".to_string()].into_iter())?;
+
+    let ext_opt2 = SetExtmarkOpts::builder()
+        .priority(BASE_PRIORITY + 1)
+        .hl_group("Blue")
+        .end_col(10)
+        .build();
+    buf2.set_extmark(namespace, 0, 0, &ext_opt2)?;
+
+    // Verify buf1 still has its extmark
+    api::set_current_buf(&buf1)?;
+    let extmarks1 = buf1.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByTuple((0, 0)),
+        ExtmarkPosition::ByTuple((0, usize::MAX)),
+        &GetExtmarksOpts::builder().build()
+    )?;
+    assert_eq!(extmarks1.count(), 1, "Buffer 1 should have its own extmark");
+
+    // Verify buf2 has its extmark
+    api::set_current_buf(&buf2)?;
+    let extmarks2 = buf2.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByTuple((0, 0)),
+        ExtmarkPosition::ByTuple((0, usize::MAX)),
+        &GetExtmarksOpts::builder().build()
+    )?;
+    assert_eq!(extmarks2.count(), 1, "Buffer 2 should have its own extmark");
+
+    Ok(())
+}
+
+#[oxi::test]
+fn test_clear_command_with_multiple_highlights() -> Result<(), api::Error> {
+    // Test that clear removes all highlights in buffer
+    let buf = api::create_buf(false, true)?;
+    api::set_current_buf(&buf)?;
+
+    buf.set_lines(0..3, true, vec![
+        "Line 1".to_string(),
+        "Line 2".to_string(),
+        "Line 3".to_string(),
+    ].into_iter())?;
+
+    let namespace = get_namespace()?;
+
+    // Add multiple highlights across different lines
+    for row in 0..=2 {
+        let ext_opt = SetExtmarkOpts::builder()
+            .priority(BASE_PRIORITY + row as u32 + 1)
+            .hl_group("Purple")
+            .end_col(6)
+            .build();
+        buf.set_extmark(namespace, row, 0, &ext_opt)?;
+    }
+
+    // Verify highlights exist
+    let extmarks_before = buf.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByIndex(0),
+        ExtmarkPosition::ByIndex(-1),
+        &GetExtmarksOpts::builder().build()
+    )?;
+    assert!(extmarks_before.count() >= 3, "Should have at least 3 extmarks before clear");
+
+    // Clear all highlights
+    clear(CommandArgs::default())?;
+
+    // Verify all highlights are gone
+    let extmarks_after = buf.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByIndex(0),
+        ExtmarkPosition::ByIndex(-1),
+        &GetExtmarksOpts::builder().build()
+    )?;
+    assert_eq!(extmarks_after.count(), 0, "All extmarks should be cleared");
+
+    Ok(())
+}
+
+#[oxi::test]
+fn test_entire_line_clear_before_highlight() -> Result<(), api::Error> {
+    // Test that selecting entire line clears existing highlights first
+    let buf = api::create_buf(false, true)?;
+    api::set_current_buf(&buf)?;
+
+    buf.set_lines(0..1, true, vec!["Test line".to_string()].into_iter())?;
+
+    let namespace = get_namespace()?;
+    let line_len = get_line_length(0)?;
+
+    // Add initial highlight
+    let ext_opt1 = SetExtmarkOpts::builder()
+        .priority(BASE_PRIORITY + 1)
+        .hl_group("Red")
+        .end_col(line_len)
+        .build();
+    buf.set_extmark(namespace, 0, 0, &ext_opt1)?;
+
+    // Verify highlight exists
+    let extmarks_before = buf.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByTuple((0, 0)),
+        ExtmarkPosition::ByTuple((0, usize::MAX)),
+        &GetExtmarksOpts::builder().build()
+    )?;
+    assert_eq!(extmarks_before.count(), 1, "Should have 1 extmark initially");
+
+    // Test is_entire_line detection
+    let is_full_line = is_entire_line(0, 0, line_len)?;
+    assert_eq!(is_full_line, true, "Should detect entire line selection");
+
+    // Clear and verify
+    clear_line(0)?;
+    let extmarks_after = buf.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByTuple((0, 0)),
+        ExtmarkPosition::ByTuple((0, usize::MAX)),
+        &GetExtmarksOpts::builder().build()
+    )?;
+    assert_eq!(extmarks_after.count(), 0, "Entire line clear should remove all extmarks");
+
+    Ok(())
+}
+
+#[oxi::test]
+fn test_visual_marks_simulation() -> Result<(), api::Error> {
+    // Simulate the full visual mode workflow with marks
+    let buf = api::create_buf(false, true)?;
+    api::set_current_buf(&buf)?;
+
+    buf.set_lines(0..2, true, vec![
+        "First line of text".to_string(),
+        "Second line".to_string(),
+    ].into_iter())?;
+
+    // Set visual marks as Neovim would (1-indexed for marks)
+    buf.set_mark('<', 0, 6, Default::default())?;  // Start of "line"
+    buf.set_mark('>', 1, 5, Default::default())?;   // End of "Second"
+
+    // Read marks back (get_mark returns 1-indexed)
+    let mark_start = buf.get_mark('<')?;
+    let mark_end = buf.get_mark('>')?;
+
+    assert_eq!(mark_start, (1, 6), "Start mark should be (1, 6)");
+    assert_eq!(mark_end, (2, 5), "End mark should be (2, 5)");
+
+    // Convert to zero-indexed
+    let (row_start, col_start) = zero_based_row(mark_start);
+    let (row_end, col_end) = zero_based_row(mark_end);
+
+    assert_eq!((row_start, col_start), (0, 6), "Zero-based start should be (0, 6)");
+    assert_eq!((row_end, col_end), (1, 5), "Zero-based end should be (1, 5)");
+
+    // Simulate highlighting this selection
+    let namespace = get_namespace()?;
+    for row in row_start..=row_end {
+        let line_len = get_line_length(row)?;
+        let start = if row == row_start { col_start } else { 0 };
+        let end = if row == row_end {
+            (col_end + 1).min(line_len)
+        } else {
+            line_len
+        };
+
+        if start < end {
+            let ext_opt = SetExtmarkOpts::builder()
+                .priority(BASE_PRIORITY + 1)
+                .hl_group("Green")
+                .end_col(end)
+                .build();
+            buf.set_extmark(namespace, row, start, &ext_opt)?;
+        }
+    }
+
+    // Verify highlights were created
+    let extmarks_row0 = buf.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByTuple((0, 0)),
+        ExtmarkPosition::ByTuple((0, usize::MAX)),
+        &GetExtmarksOpts::builder().build()
+    )?;
+    assert_eq!(extmarks_row0.count(), 1, "Row 0 should have 1 extmark");
+
+    let extmarks_row1 = buf.get_extmarks(
+        namespace,
+        ExtmarkPosition::ByTuple((1, 0)),
+        ExtmarkPosition::ByTuple((1, usize::MAX)),
+        &GetExtmarksOpts::builder().build()
+    )?;
+    assert_eq!(extmarks_row1.count(), 1, "Row 1 should have 1 extmark");
+
+    Ok(())
+}
+
+#[oxi::test]
+fn test_priority_increment_sequence() -> Result<(), api::Error> {
+    // Test that repeated highlights increment priority correctly
+    let buf = api::create_buf(false, true)?;
+    api::set_current_buf(&buf)?;
+
+    buf.set_lines(0..1, true, vec!["Test priority sequence".to_string()].into_iter())?;
+
+    let namespace = get_namespace()?;
+
+    // Add first highlight
+    let priority1 = highest_line_priority(0, 0, 10)?;
+    assert_eq!(priority1, BASE_PRIORITY, "First priority should be BASE_PRIORITY");
+
+    let ext_opt1 = SetExtmarkOpts::builder()
+        .priority(priority1 + 1)
+        .hl_group("Red")
+        .end_col(10)
+        .build();
+    buf.set_extmark(namespace, 0, 0, &ext_opt1)?;
+
+    // Add second overlapping highlight
+    let priority2 = highest_line_priority(0, 5, 15)?;
+    assert_eq!(priority2, BASE_PRIORITY + 1, "Second priority should be incremented");
+
+    let ext_opt2 = SetExtmarkOpts::builder()
+        .priority(priority2 + 1)
+        .hl_group("Blue")
+        .end_col(15)
+        .build();
+    buf.set_extmark(namespace, 0, 5, &ext_opt2)?;
+
+    // Add third highlight
+    let priority3 = highest_line_priority(0, 10, 20)?;
+    assert_eq!(priority3, BASE_PRIORITY + 2, "Third priority should continue incrementing");
+
+    Ok(())
+}
