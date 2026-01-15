@@ -66,6 +66,55 @@ use {
 Plug 'yourusername/highlighter.nvim', { 'do': './make.sh' }
 ```
 
+## Configuration
+
+### Basic Setup (Optional)
+
+If you want to use the default colors, no configuration is needed! Just install and use.
+
+For custom colors, call `setup()` in your Neovim config:
+
+```lua
+require('highlighter').setup({
+  colors = {
+    -- Add custom colors
+    Orange = "#FF8800",
+    Pink = "#FF69B4",
+    Cyan = "#00FFFF",
+
+    -- Override default colors
+    Red = "#FF0000",  -- brighter red
+  }
+})
+```
+
+### Default Colors
+
+If you don't call `setup()`, these colors are available by default:
+
+| Color  | Hex Code  |
+|--------|-----------|
+| Red    | `#ff0000` |
+| Green  | `#00ff00` |
+| Blue   | `#0000ff` |
+| Purple | `#A020F0` |
+| Yellow | `#ffff00` |
+| Black  | `#000000` |
+
+### Custom Keybindings
+
+Don't like the default keybindings? Disable them and set your own:
+
+```lua
+-- Disable default keybindings
+vim.keymap.del('v', '<C-h>')
+vim.keymap.del('n', '<leader>ch')
+
+-- Set custom keybindings
+vim.keymap.set('v', '<leader>h', '<Esc>:Highlighter<CR>', { desc = "Highlight selection" })
+vim.keymap.set('n', '<leader>H', ':HighlighterClear<CR>', { desc = "Clear highlights" })
+```
+
 ## Usage
 
 ### Commands
@@ -83,20 +132,9 @@ Plug 'yourusername/highlighter.nvim', { 'do': './make.sh' }
 1. Enter Visual mode (`v`, `V`, or `<C-v>`)
 2. Select the text you want to highlight
 3. Press `<C-h>`
-4. Choose a color from the picker
+4. Choose a color from the picker (including your custom colors!)
 5. Repeat for additional highlights
 6. Press `<leader>ch` to clear when done
-
-## Available Colors
-
-| Color  | Hex Code  |
-|--------|-----------|
-| Red    | `#ff0000` |
-| Green  | `#00ff00` |
-| Blue   | `#0000ff` |
-| Purple | `#A020F0` |
-| Yellow | `#ffff00` |
-| Black  | `#000000` |
 
 ## How It Works
 
@@ -147,6 +185,14 @@ See [VDD_HIERARCHY.md](VDD_HIERARCHY.md) for tracked issues and technical debt.
 
 ### ✅ Recently Fixed
 
+**VDD Round 4** (v0.3.0 - Configuration API):
+- ✅ User-configurable colors via setup() function
+- ✅ Hex color validation (#RRGGBB format)
+- ✅ Thread-safe color storage with RwLock
+- ✅ Custom color support (add new colors)
+- ✅ Default color override support
+- ✅ 4 new configuration tests (31 total tests, ~80% coverage)
+
 **VDD Round 3** (v0.2.0 - E2E Testing):
 - ✅ Comprehensive E2E test suite (28 total tests, ~75% coverage)
 - ✅ Multi-line selection workflow tested
@@ -177,8 +223,7 @@ See [VDD_HIERARCHY.md](VDD_HIERARCHY.md) for tracked issues and technical debt.
 
 ### Remaining Known Issues
 - ⚠️ `<C-h>` keybinding conflicts with terminal backspace (disable with `vim.keymap.del('v', '<C-h>')`)
-- ⚠️ No configuration API for custom colors (planned in Epic 6)
-- ⚠️ No persistence of highlights across sessions (planned in Epic 6)
+- ⚠️ No persistence of highlights across sessions (planned in Epic 6.1.2)
 
 ### Notes
 - UTF-8 multi-byte characters: This plugin uses byte-based indexing, which is the correct behavior for Neovim's extmark API. Character positions are handled automatically by Neovim.

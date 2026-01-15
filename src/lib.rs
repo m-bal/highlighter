@@ -1,6 +1,7 @@
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
-use mlua::prelude::{LuaError, LuaFunction, LuaTable};
+use mlua::prelude::{LuaError, LuaFunction, LuaTable, LuaValue};
 use nvim_oxi::{
     self as oxi,
     api::{self, opts::*, types::*},
@@ -20,9 +21,9 @@ const MAX_SAFE_PRIORITY: u32 = u32::MAX - 1000;
 /// Unique namespace identifier to avoid collisions with other plugins.
 const NAMESPACE_ID: &str = "highlighter.nvim";
 
-/// Color definitions: (name, hex_code)
+/// Default color definitions: (name, hex_code)
 /// Using static str slices to avoid heap allocations.
-const COLORS: &[(&str, &str)] = &[
+const DEFAULT_COLORS: &[(&str, &str)] = &[
     ("Red", "#ff0000"),
     ("Green", "#00ff00"),
     ("Blue", "#0000ff"),
@@ -35,12 +36,31 @@ const COLORS: &[(&str, &str)] = &[
 /// Using OnceLock instead of lazy_static for better error handling.
 static PLUGIN_NAMESPACE: OnceLock<u32> = OnceLock::new();
 
+/// User-configured colors, initialized via setup() function.
+/// Falls back to DEFAULT_COLORS if not configured.
+static USER_COLORS: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+
 /// Get or initialize the plugin namespace.
 /// Returns an error if namespace creation fails.
 fn get_namespace() -> Result<u32, api::Error> {
     PLUGIN_NAMESPACE
         .get_or_try_init(|| api::create_namespace(NAMESPACE_ID))
         .copied()
+}
+
+/// Get the configured colors (user-configured or defaults).
+fn get_colors() -> HashMap<String, String> {
+    let colors_lock = USER_COLORS.get_or_init(|| {
+        // Initialize with defaults if not configured
+        let mut default_map = HashMap::new();
+        for (name, hex) in DEFAULT_COLORS.iter() {
+            default_map.insert(name.to_string(), hex.to_string());
+        }
+        RwLock::new(default_map)
+    });
+
+    // Return a clone of the current colors
+    colors_lock.read().unwrap().clone()
 }
 
 // ============================================================================
@@ -128,9 +148,10 @@ fn to_user_error(context: &str, err: api::Error) -> String {
 ///
 /// Generic parameter T is required by mlua callback signature but unused.
 fn perform_highlight<T>(_: T, choice: String) -> Result<(), LuaError> {
-    // Validate color choice
-    if !COLORS.iter().any(|(name, _)| *name == choice) {
-        let valid_colors: Vec<&str> = COLORS.iter().map(|(name, _)| *name).collect();
+    // Validate color choice against configured colors
+    let colors = get_colors();
+    if !colors.contains_key(&choice) {
+        let valid_colors: Vec<String> = colors.keys().cloned().collect();
         return Err(LuaError::RuntimeError(format!(
             "Invalid color '{}'. Valid colors are: {}",
             choice,
@@ -214,8 +235,9 @@ fn perform_highlight<T>(_: T, choice: String) -> Result<(), LuaError> {
 fn prompt_for_color_option() -> Result<(), String> {
     let lua = oxi::mlua::lua();
 
-    // Extract color names from COLORS array
-    let color_names: Vec<&str> = COLORS.iter().map(|(name, _)| *name).collect();
+    // Extract color names from configured colors
+    let colors = get_colors();
+    let color_names: Vec<String> = colors.keys().cloned().collect();
 
     let items = lua
         .create_sequence_from(color_names)
@@ -245,6 +267,67 @@ fn prompt_for_color_option() -> Result<(), String> {
     select
         .call::<_, ()>((items, opts, perform_highlight_callback))
         .map_err(|e| format!("Color picker failed: {}", e))?;
+
+    Ok(())
+}
+
+// ============================================================================
+// CONFIGURATION API
+// ============================================================================
+
+/// Validates a hex color code format.
+/// Returns true if the hex code is valid (#RRGGBB format).
+fn is_valid_hex_color(hex: &str) -> bool {
+    if !hex.starts_with('#') || hex.len() != 7 {
+        return false;
+    }
+    hex[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Setup function for user configuration.
+/// This is exposed to Lua via the module API.
+///
+/// Example usage in Lua:
+/// ```lua
+/// require('highlighter').setup({
+///   colors = {
+///     Red = "#ff0000",
+///     MyCustomColor = "#123456",
+///   }
+/// })
+/// ```
+pub fn setup(config: LuaTable) -> Result<(), LuaError> {
+    // Get the colors table from config
+    let colors_table: Option<LuaTable> = config.get("colors").ok();
+
+    if let Some(colors_table) = colors_table {
+        let colors_lock = USER_COLORS.get_or_init(|| {
+            // Start with defaults
+            let mut default_map = HashMap::new();
+            for (name, hex) in DEFAULT_COLORS.iter() {
+                default_map.insert(name.to_string(), hex.to_string());
+            }
+            RwLock::new(default_map)
+        });
+
+        let mut colors = colors_lock.write().unwrap();
+
+        // Iterate over user-provided colors
+        for pair in colors_table.pairs::<String, String>() {
+            let (name, hex) = pair?;
+
+            // Validate hex color
+            if !is_valid_hex_color(&hex) {
+                return Err(LuaError::RuntimeError(format!(
+                    "Invalid hex color '{}' for '{}'. Expected format: #RRGGBB",
+                    hex, name
+                )));
+            }
+
+            // Add or override color
+            colors.insert(name, hex);
+        }
+    }
 
     Ok(())
 }
@@ -284,13 +367,15 @@ pub fn clear(_args: CommandArgs) -> Result<(), api::Error> {
 
 /// Neovim plugin module initialization.
 /// Sets up highlight groups, commands, and keymaps.
+/// Exports the setup() function for user configuration.
 #[oxi::module]
 fn highlighter() -> oxi::Result<()> {
     // Initialize namespace early to catch any initialization errors
     let _ = get_namespace()?;
 
-    // Register highlight groups for each color
-    for (name, hex) in COLORS.iter() {
+    // Register highlight groups for configured colors
+    let colors = get_colors();
+    for (name, hex) in colors.iter() {
         let highlight_opt = &SetHighlightOpts::builder().foreground(hex).build();
         api::set_hl(0, name, highlight_opt)?;
     }
@@ -379,20 +464,44 @@ mod tests {
     }
 
     #[test]
-    fn test_color_definitions() {
-        // Verify colors array is properly defined
-        assert!(COLORS.len() == 6, "Should have 6 predefined colors");
+    fn test_default_color_definitions() {
+        // Verify default colors array is properly defined
+        assert_eq!(DEFAULT_COLORS.len(), 6, "Should have 6 default colors");
 
         // Verify specific colors exist
-        assert!(COLORS.iter().any(|(name, _)| *name == "Red"));
-        assert!(COLORS.iter().any(|(name, _)| *name == "Green"));
-        assert!(COLORS.iter().any(|(name, _)| *name == "Blue"));
+        assert!(DEFAULT_COLORS.iter().any(|(name, _)| *name == "Red"));
+        assert!(DEFAULT_COLORS.iter().any(|(name, _)| *name == "Green"));
+        assert!(DEFAULT_COLORS.iter().any(|(name, _)| *name == "Blue"));
 
         // Verify hex codes are valid format (start with #, 7 chars)
-        for (_, hex) in COLORS.iter() {
+        for (_, hex) in DEFAULT_COLORS.iter() {
             assert!(hex.starts_with('#'), "Hex code should start with #");
             assert_eq!(hex.len(), 7, "Hex code should be 7 characters");
         }
+    }
+
+    #[test]
+    fn test_hex_color_validation() {
+        // Valid hex colors
+        assert!(is_valid_hex_color("#ff0000"), "Valid red color");
+        assert!(is_valid_hex_color("#00FF00"), "Valid green color (uppercase)");
+        assert!(is_valid_hex_color("#123456"), "Valid custom color");
+
+        // Invalid hex colors
+        assert!(!is_valid_hex_color("ff0000"), "Missing #");
+        assert!(!is_valid_hex_color("#ff00"), "Too short");
+        assert!(!is_valid_hex_color("#ff00000"), "Too long");
+        assert!(!is_valid_hex_color("#gggggg"), "Invalid hex digits");
+        assert!(!is_valid_hex_color(""), "Empty string");
+    }
+
+    #[test]
+    fn test_get_colors_defaults() {
+        // Test that get_colors returns defaults when not configured
+        let colors = get_colors();
+        assert!(colors.len() >= 6, "Should have at least default colors");
+        assert!(colors.contains_key("Red"), "Should have Red");
+        assert_eq!(colors.get("Red"), Some(&"#ff0000".to_string()));
     }
 
     #[test]
@@ -415,21 +524,20 @@ fn test_namespace_initialization() {
 }
 
 #[oxi::test]
-fn test_colors_array_integrity() {
-    // Verify all expected colors are present
-    assert_eq!(COLORS.len(), 6, "Should have 6 predefined colors");
+fn test_colors_integrity() {
+    // Verify configured colors (defaults if not configured)
+    let colors = get_colors();
+    assert!(colors.len() >= 6, "Should have at least 6 default colors");
 
-    let color_names: Vec<&str> = COLORS.iter().map(|(name, _)| *name).collect();
-    assert!(color_names.contains(&"Red"));
-    assert!(color_names.contains(&"Green"));
-    assert!(color_names.contains(&"Blue"));
-    assert!(color_names.contains(&"Purple"));
-    assert!(color_names.contains(&"Yellow"));
-    assert!(color_names.contains(&"Black"));
+    assert!(colors.contains_key("Red"));
+    assert!(colors.contains_key("Green"));
+    assert!(colors.contains_key("Blue"));
+    assert!(colors.contains_key("Purple"));
+    assert!(colors.contains_key("Yellow"));
+    assert!(colors.contains_key("Black"));
 
     // Verify color values
-    let red = COLORS.iter().find(|(name, _)| *name == "Red").unwrap();
-    assert_eq!(red.1, "#ff0000");
+    assert_eq!(colors.get("Red"), Some(&"#ff0000".to_string()));
 }
 
 #[oxi::test]
@@ -925,4 +1033,72 @@ fn test_priority_increment_sequence() -> Result<(), api::Error> {
     assert_eq!(priority3, BASE_PRIORITY + 2, "Third priority should continue incrementing");
 
     Ok(())
+}
+
+// ============================================================================
+// CONFIGURATION TESTS
+// ============================================================================
+
+#[oxi::test]
+fn test_setup_with_custom_colors() {
+    let lua = oxi::mlua::lua();
+
+    // Create a config table
+    let config = lua.create_table().unwrap();
+    let colors_table = lua.create_table().unwrap();
+
+    // Add custom colors
+    colors_table.set("MyOrange", "#FF8800").unwrap();
+    colors_table.set("MyPink", "#FF69B4").unwrap();
+
+    config.set("colors", colors_table).unwrap();
+
+    // Call setup
+    let result = setup(config);
+    assert!(result.is_ok(), "Setup should succeed with valid colors");
+
+    // Verify custom colors are available
+    let colors = get_colors();
+    assert!(colors.contains_key("MyOrange"), "Custom color MyOrange should be available");
+    assert!(colors.contains_key("MyPink"), "Custom color MyPink should be available");
+    assert_eq!(colors.get("MyOrange"), Some(&"#FF8800".to_string()));
+    assert_eq!(colors.get("MyPink"), Some(&"#FF69B4".to_string()));
+
+    // Verify defaults still exist
+    assert!(colors.contains_key("Red"), "Default colors should still be available");
+}
+
+#[oxi::test]
+fn test_setup_with_invalid_hex() {
+    let lua = oxi::mlua::lua();
+
+    let config = lua.create_table().unwrap();
+    let colors_table = lua.create_table().unwrap();
+
+    // Add invalid hex color
+    colors_table.set("BadColor", "not-a-hex").unwrap();
+    config.set("colors", colors_table).unwrap();
+
+    // Call setup - should fail
+    let result = setup(config);
+    assert!(result.is_err(), "Setup should fail with invalid hex color");
+}
+
+#[oxi::test]
+fn test_setup_override_default_color() {
+    let lua = oxi::mlua::lua();
+
+    let config = lua.create_table().unwrap();
+    let colors_table = lua.create_table().unwrap();
+
+    // Override default Red color
+    colors_table.set("Red", "#990000").unwrap();
+    config.set("colors", colors_table).unwrap();
+
+    let result = setup(config);
+    assert!(result.is_ok(), "Setup should succeed");
+
+    // Verify Red was overridden
+    let colors = get_colors();
+    assert_eq!(colors.get("Red"), Some(&"#990000".to_string()), "Red should be overridden");
 }

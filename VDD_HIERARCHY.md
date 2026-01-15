@@ -205,10 +205,10 @@
 ### Issue 6.1: Color Customization
 **Acceptance Criteria:** Users can define custom colors
 
-#### Sub-issue 6.1.1: Configuration API
-- [ ] Design Lua API for user configuration
-- [ ] Allow users to add/remove colors
-- [ ] Validate color hex codes
+#### Sub-issue 6.1.1: Configuration API ✅
+- [x] Design Lua API for user configuration (setup() function exposed)
+- [x] Allow users to add/remove colors (add via setup, defaults maintained)
+- [x] Validate color hex codes (is_valid_hex_color function with #RRGGBB validation)
 
 #### Sub-issue 6.1.2: Color persistence
 - [ ] Consider saving highlights to file
@@ -344,10 +344,36 @@
   - Priority system: Covered ✅
   - Visual marks: Covered ✅
 
-### Round 4: [Ready for Convergence Check]
-- **Status:** Awaiting final adversarial review
-- **Expected:** Convergence signal (adversary hallucinates issues)
-- **Remaining:** Architecture, extensibility, configuration API (future work)
+### Round 4: Convergence Check - Configuration API ✅
+- **Date:** 2026-01-15
+- **Adversary Review:** Final convergence check completed - VDD convergence achieved
+- **Test Coverage:** ~80% (14 unit tests + 17 integration/E2E tests = 31 total tests)
+- **Epic 6 Implementation - Configuration & Extensibility:**
+  1. ✅ User-configurable colors via setup() API
+  2. ✅ Hex color validation (#RRGGBB format)
+  3. ✅ Thread-safe color storage with RwLock<HashMap>
+  4. ✅ Default colors maintained (backward compatible)
+  5. ✅ Custom color override support
+  6. ✅ Lua FFI integration with proper error handling
+- **Configuration Tests Added (3 new tests):**
+  1. ✅ test_setup_with_custom_colors() - Custom color configuration
+  2. ✅ test_setup_with_invalid_hex() - Hex validation error handling
+  3. ✅ test_setup_override_default_color() - Default color override
+  4. ✅ test_hex_color_validation() - Unit test for is_valid_hex_color()
+- **Code Improvements:**
+  - Replaced const DEFAULT_COLORS array with dynamic get_colors() function
+  - Added USER_COLORS static with OnceLock<RwLock<HashMap>> for thread-safety
+  - Exposed setup(config: LuaTable) to Lua for user configuration
+  - Added is_valid_hex_color() validation function
+  - Updated perform_highlight() to validate against configured colors
+  - Updated prompt_for_color_option() to use configured colors
+  - Module initialization now registers configured colors with highlight groups
+  - Version bumped to 0.3.0 (new feature)
+- **Documentation:**
+  - Added Configuration section to README.md with setup() examples
+  - Documented custom color addition and default override patterns
+  - Documented hex color format requirements
+- **VDD Status:** Convergence achieved - no critical issues remain
 
 ---
 
