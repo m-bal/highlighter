@@ -145,7 +145,20 @@ This project follows **Verification-Driven Development (VDD)** methodology. See 
 
 See [VDD_HIERARCHY.md](VDD_HIERARCHY.md) for tracked issues and technical debt.
 
-### ✅ Recently Fixed (VDD Round 1)
+### ✅ Recently Fixed
+
+**VDD Round 2** (v0.2.0):
+- ✅ Safe initialization with OnceLock (no startup panics)
+- ✅ Error propagation instead of silent failures
+- ✅ User-friendly error messages
+- ✅ Unique namespace identifier ("highlighter.nvim")
+- ✅ Proper buffer range handling (no usize::MAX)
+- ✅ Zero-allocation color definitions
+- ✅ Removed lazy_static dependency
+- ✅ Keymap conflict documented with workaround
+- ✅ Empty range handling for block selections
+
+**VDD Round 1** (v0.1.0):
 - ✅ All `.unwrap()` calls replaced with proper error handling
 - ✅ Priority overflow protection with MAX_SAFE_PRIORITY
 - ✅ Color validation before applying highlights
@@ -153,9 +166,12 @@ See [VDD_HIERARCHY.md](VDD_HIERARCHY.md) for tracked issues and technical debt.
 - ✅ Off-by-one error in clear_line range fixed
 
 ### Remaining Known Issues
-- ⚠️ UTF-8 multi-byte character positions may not align with visual columns (documented)
+- ⚠️ `<C-h>` keybinding conflicts with terminal backspace (disable with `vim.keymap.del('v', '<C-h>')`)
 - ⚠️ No configuration API for custom colors (planned in Epic 6)
 - ⚠️ No persistence of highlights across sessions (planned in Epic 6)
+
+### Notes
+- UTF-8 multi-byte characters: This plugin uses byte-based indexing, which is the correct behavior for Neovim's extmark API. Character positions are handled automatically by Neovim.
 
 ## Contributing
 

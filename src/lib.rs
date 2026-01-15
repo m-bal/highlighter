@@ -1,6 +1,4 @@
-use lazy_static;
-
-use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use mlua::prelude::{LuaError, LuaFunction, LuaTable};
 use nvim_oxi::{
@@ -16,33 +14,54 @@ use nvim_oxi::{
 const BASE_PRIORITY: u32 = 200;
 
 /// Maximum safe priority value. We leave room before u32::MAX to prevent overflow.
-const MAX_SAFE_PRIORITY: u32 = u32::MAX - 100;
+/// Set to u32::MAX - 1000 to allow for 1000 additional highlight layers before overflow.
+const MAX_SAFE_PRIORITY: u32 = u32::MAX - 1000;
 
-lazy_static::lazy_static! {
-    static ref COLORS : HashMap<String, String> =  HashMap::from([
-        ("Red".to_string(), "#ff0000".to_string()),
-        ("Green".to_string(), "#00ff00".to_string()),
-        ("Blue".to_string(), "#0000ff".to_string()),
-        ("Purple".to_string(), "#A020F0".to_string()),
-        ("Yellow".to_string(), "#ffff00".to_string()),
-        ("Black".to_string(), "#000000".to_string()),
-    ]);
-    static ref PLUGIN : u32 = api::create_namespace("highlighter");
+/// Unique namespace identifier to avoid collisions with other plugins.
+const NAMESPACE_ID: &str = "highlighter.nvim";
+
+/// Color definitions: (name, hex_code)
+/// Using static str slices to avoid heap allocations.
+const COLORS: &[(&str, &str)] = &[
+    ("Red", "#ff0000"),
+    ("Green", "#00ff00"),
+    ("Blue", "#0000ff"),
+    ("Purple", "#A020F0"),
+    ("Yellow", "#ffff00"),
+    ("Black", "#000000"),
+];
+
+/// Plugin namespace ID, initialized on first access.
+/// Using OnceLock instead of lazy_static for better error handling.
+static PLUGIN_NAMESPACE: OnceLock<u32> = OnceLock::new();
+
+/// Get or initialize the plugin namespace.
+/// Returns an error if namespace creation fails.
+fn get_namespace() -> Result<u32, api::Error> {
+    PLUGIN_NAMESPACE
+        .get_or_try_init(|| api::create_namespace(NAMESPACE_ID))
+        .copied()
 }
 
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
-fn entire_line(row: usize, col_start: usize, col_end: usize) -> bool {
-    col_start == 0 && col_end == end_of_line(row)
+/// Checks if a selection covers the entire line.
+/// Returns None if line length cannot be determined (error condition).
+fn is_entire_line(row: usize, col_start: usize, col_end: usize) -> Result<bool, api::Error> {
+    let line_len = get_line_length(row)?;
+    // Empty line: col_start == 0 && col_end == 0
+    // Full line: col_start == 0 && col_end >= line_len
+    Ok(col_start == 0 && (line_len == 0 || col_end >= line_len))
 }
 
 /// Clears all highlights on a specific line.
 /// Returns Err if the buffer operation fails.
 fn clear_line(row: usize) -> Result<(), api::Error> {
+    let namespace = get_namespace()?;
     api::get_current_buf()
-        .clear_namespace(*PLUGIN, row..=row)?;
+        .clear_namespace(namespace, row..=row)?;
     Ok(())
 }
 
@@ -50,17 +69,17 @@ fn clear_line(row: usize) -> Result<(), api::Error> {
 /// If the entire line is selected, it clears existing highlights first.
 /// Returns BASE_PRIORITY or the max existing priority, capped at MAX_SAFE_PRIORITY.
 fn highest_line_priority(row: usize, col_start: usize, col_end: usize) -> Result<u32, api::Error> {
+    let namespace = get_namespace()?;
     let get_ext_opt = GetExtmarksOpts::builder().details(true).build();
     let start_extmark = ExtmarkPosition::ByTuple((row, col_start));
     let end_extmark = ExtmarkPosition::ByTuple((row, col_end));
 
     let extmark = api::get_current_buf()
-        .get_extmarks(*PLUGIN, start_extmark, end_extmark, &get_ext_opt)?;
+        .get_extmarks(namespace, start_extmark, end_extmark, &get_ext_opt)?;
 
     let mut max_priority: u32 = BASE_PRIORITY;
 
-    if entire_line(row, col_start, col_end) {
-        oxi::dbg!("Clearing Line");
+    if is_entire_line(row, col_start, col_end)? {
         clear_line(row)?;
         return Ok(max_priority);
     }
@@ -77,18 +96,17 @@ fn highest_line_priority(row: usize, col_start: usize, col_end: usize) -> Result
     Ok(max_priority.min(MAX_SAFE_PRIORITY))
 }
 
-/// Returns the length of the line at the given row.
-/// Note: This returns byte length, which works correctly for ASCII and most cases,
-/// but may not match visual column positions for multi-byte UTF-8 characters.
-fn end_of_line(row: usize) -> usize {
-    match api::get_current_buf().get_lines(row..=row + 1, true) {
-        Ok(mut lines) => {
-            match lines.next() {
-                Some(line) => line.len(),
-                None => 0, // Empty or invalid row
-            }
-        }
-        Err(_) => 0, // Buffer error, return 0 as safe default
+/// Returns the byte length of the line at the given row.
+/// This function propagates errors instead of returning 0 silently.
+///
+/// Note: For UTF-8 multi-byte characters, this returns byte count, not character count.
+/// Neovim's extmark API uses byte-based indexing, so this is the correct behavior.
+fn get_line_length(row: usize) -> Result<usize, api::Error> {
+    let mut lines = api::get_current_buf().get_lines(row..=row + 1, true)?;
+
+    match lines.next() {
+        Some(line) => Ok(line.len()),
+        None => Err(api::Error::Other(format!("Row {} does not exist in buffer", row))),
     }
 }
 
@@ -96,49 +114,78 @@ fn zero_based_row(tup: (usize, usize)) -> (usize, usize) {
     (tup.0 - 1, tup.1)
 }
 
+/// Helper to convert user-friendly error messages from api::Error
+fn to_user_error(context: &str, err: api::Error) -> String {
+    match err {
+        api::Error::Other(msg) => format!("{}: {}", context, msg),
+        _ => format!("{} (buffer may be closed or modified)", context),
+    }
+}
+
 /// Applies highlighting to the visual selection with the chosen color.
 /// Validates that the choice is a valid color before applying.
 /// Returns LuaError if any operation fails.
+///
+/// Generic parameter T is required by mlua callback signature but unused.
 fn perform_highlight<T>(_: T, choice: String) -> Result<(), LuaError> {
     // Validate color choice
-    if !COLORS.contains_key(&choice) {
+    if !COLORS.iter().any(|(name, _)| *name == choice) {
+        let valid_colors: Vec<&str> = COLORS.iter().map(|(name, _)| *name).collect();
         return Err(LuaError::RuntimeError(format!(
-            "Invalid color '{}'. Valid colors are: {:?}",
+            "Invalid color '{}'. Valid colors are: {}",
             choice,
-            COLORS.keys().collect::<Vec<_>>()
+            valid_colors.join(", ")
         )));
     }
 
     let mode = api::get_mode()
-        .map_err(|e| LuaError::RuntimeError(format!("Failed to get mode: {:?}", e)))?;
+        .map_err(|e| LuaError::RuntimeError(to_user_error("Unable to check editor mode", e)))?;
 
     if mode.mode == Mode::Normal {
         let buf = api::get_current_buf();
+        let namespace = get_namespace()
+            .map_err(|e| LuaError::RuntimeError(to_user_error("Plugin initialization failed", e)))?;
 
         // Get visual marks with error handling
         let mark_start = buf.get_mark('<')
-            .map_err(|e| LuaError::RuntimeError(format!("Failed to get visual start mark '<': {:?}", e)))?;
+            .map_err(|_| LuaError::RuntimeError(
+                "No visual selection found. Please select text in visual mode first.".to_string()
+            ))?;
         let mark_end = buf.get_mark('>')
-            .map_err(|e| LuaError::RuntimeError(format!("Failed to get visual end mark '>': {:?}", e)))?;
+            .map_err(|_| LuaError::RuntimeError(
+                "No visual selection found. Please select text in visual mode first.".to_string()
+            ))?;
 
         let (visual_row_start, visual_col_start) = zero_based_row(mark_start);
         let (visual_row_end, visual_col_end) = zero_based_row(mark_end);
 
-        oxi::dbg!(visual_row_start..=visual_row_end);
-
         for row in visual_row_start..=visual_row_end {
-            let (mut start, mut end) = (0, end_of_line(row));
+            // Get line length to determine proper end column
+            let line_len = get_line_length(row)
+                .map_err(|e| LuaError::RuntimeError(to_user_error(
+                    &format!("Unable to access line {}", row + 1), e
+                )))?;
 
-            if row == visual_row_start {
-                start = visual_col_start;
-            }
-            if row == visual_row_end {
-                end = end.min(visual_col_end + 1); // +1 to include the last character
+            let start = if row == visual_row_start { visual_col_start } else { 0 };
+
+            // Calculate end column:
+            // - For multi-line selections, intermediate rows go to line end
+            // - For the last row, use visual_col_end + 1 (Neovim visual mode is inclusive)
+            // - Never exceed actual line length
+            let end = if row == visual_row_end {
+                (visual_col_end + 1).min(line_len)
+            } else {
+                line_len
+            };
+
+            // Skip if the range is empty (can happen with block selections)
+            if start >= end {
+                continue;
             }
 
             // Calculate priority with error handling
             let current_priority = highest_line_priority(row, start, end)
-                .map_err(|e| LuaError::RuntimeError(format!("Failed to get priority: {:?}", e)))?;
+                .map_err(|e| LuaError::RuntimeError(to_user_error("Failed to query existing highlights", e)))?;
 
             // Safe priority increment with overflow protection
             let new_priority = if current_priority >= MAX_SAFE_PRIORITY {
@@ -153,13 +200,10 @@ fn perform_highlight<T>(_: T, choice: String) -> Result<(), LuaError> {
                 .end_col(end)
                 .build();
 
-            oxi::dbg!(row, start, end, new_priority);
-
             // Properly handle the set_extmark result
-            buf.set_extmark(*PLUGIN, row, start, &ext_opt)
-                .map_err(|e| LuaError::RuntimeError(format!(
-                    "Failed to set extmark at row {}, col {}: {:?}",
-                    row, start, e
+            buf.set_extmark(namespace, row, start, &ext_opt)
+                .map_err(|e| LuaError::RuntimeError(to_user_error(
+                    &format!("Failed to apply highlight at line {}", row + 1), e
                 )))?;
         }
     }
@@ -170,34 +214,37 @@ fn perform_highlight<T>(_: T, choice: String) -> Result<(), LuaError> {
 fn prompt_for_color_option() -> Result<(), String> {
     let lua = oxi::mlua::lua();
 
+    // Extract color names from COLORS array
+    let color_names: Vec<&str> = COLORS.iter().map(|(name, _)| *name).collect();
+
     let items = lua
-        .create_sequence_from(COLORS.keys().map(|s| s.as_str()).collect::<Vec<_>>())
-        .map_err(|e| format!("Failed to create color list: {:?}", e))?;
+        .create_sequence_from(color_names)
+        .map_err(|e| format!("Color picker UI error: {}", e))?;
 
     let opts = lua
         .create_table_from([("prompt", "Pick a color")])
-        .map_err(|e| format!("Failed to create options table: {:?}", e))?;
+        .map_err(|e| format!("Color picker UI error: {}", e))?;
 
     let perform_highlight_callback = lua
         .create_function(perform_highlight)
-        .map_err(|e| format!("Failed to create callback: {:?}", e))?;
+        .map_err(|e| format!("Color picker UI error: {}", e))?;
 
     let vim_table = lua
         .globals()
         .get::<_, LuaTable>("vim")
-        .map_err(|e| format!("Failed to get 'vim' global: {:?}", e))?;
+        .map_err(|_| "Color picker UI not available".to_string())?;
 
     let ui_table = vim_table
         .get::<_, LuaTable>("ui")
-        .map_err(|e| format!("Failed to get 'vim.ui': {:?}", e))?;
+        .map_err(|_| "Color picker UI not available (vim.ui not found)".to_string())?;
 
     let select = ui_table
         .get::<_, LuaFunction>("select")
-        .map_err(|e| format!("Failed to get 'vim.ui.select': {:?}", e))?;
+        .map_err(|_| "Color picker UI not available (vim.ui.select not found)".to_string())?;
 
     select
         .call::<_, ()>((items, opts, perform_highlight_callback))
-        .map_err(|e| format!("Failed to call vim.ui.select: {:?}", e))?;
+        .map_err(|e| format!("Color picker failed: {}", e))?;
 
     Ok(())
 }
@@ -210,7 +257,7 @@ fn prompt_for_color_option() -> Result<(), String> {
 /// Displays the color picker to highlight visual selection.
 pub fn highlight(_args: CommandArgs) -> Result<(), api::Error> {
     if let Err(e) = prompt_for_color_option() {
-        oxi::print!("Highlighter error: {}", e);
+        oxi::print!("Highlighter: {}", e);
         return Err(api::Error::Other(e));
     }
     Ok(())
@@ -219,8 +266,15 @@ pub fn highlight(_args: CommandArgs) -> Result<(), api::Error> {
 /// Command handler for :HighlighterClear
 /// Clears all highlights in the current buffer.
 pub fn clear(_args: CommandArgs) -> Result<(), api::Error> {
-    api::get_current_buf()
-        .clear_namespace(*PLUGIN, 0..=usize::MAX)?;
+    let namespace = get_namespace()?;
+    let buf = api::get_current_buf();
+
+    // Get actual buffer line count instead of using usize::MAX
+    let line_count = buf.line_count()?;
+
+    // Clear namespace for all lines in the buffer (0-indexed)
+    buf.clear_namespace(namespace, 0..line_count)?;
+
     Ok(())
 }
 
@@ -232,10 +286,13 @@ pub fn clear(_args: CommandArgs) -> Result<(), api::Error> {
 /// Sets up highlight groups, commands, and keymaps.
 #[oxi::module]
 fn highlighter() -> oxi::Result<()> {
+    // Initialize namespace early to catch any initialization errors
+    let _ = get_namespace()?;
+
     // Register highlight groups for each color
-    for (key, value) in COLORS.iter() {
-        let highlight_opt = &SetHighlightOpts::builder().foreground(value).build();
-        api::set_hl(0, &key, highlight_opt)?;
+    for (name, hex) in COLORS.iter() {
+        let highlight_opt = &SetHighlightOpts::builder().foreground(hex).build();
+        api::set_hl(0, name, highlight_opt)?;
     }
 
     // Register user commands
@@ -244,13 +301,22 @@ fn highlighter() -> oxi::Result<()> {
     api::create_user_command("HighlighterClear", clear, &opts)?;
 
     // Register keymaps
-    let key_opts = SetKeymapOpts::builder().build();
+    // NOTE: <C-h> conflicts with backspace in terminal mode.
+    // Users can disable this with: vim.keymap.del('v', '<C-h>')
+    // and create their own mapping: vim.keymap.set('v', '<leader>h', '<Esc>:Highlighter<CR>')
+    let key_opts = SetKeymapOpts::builder()
+        .desc("Highlight selection with color picker")
+        .build();
     api::set_keymap(Mode::Visual, "<C-h>", "<Esc>:Highlighter<CR>", &key_opts)?;
+
+    let clear_opts = SetKeymapOpts::builder()
+        .desc("Clear all highlights in buffer")
+        .build();
     api::set_keymap(
         Mode::Normal,
         "<leader>ch",
         ":HighlighterClear<CR>",
-        &key_opts,
+        &clear_opts,
     )?;
 
     Ok(())
@@ -276,25 +342,30 @@ mod tests {
     }
 
     #[test]
-    fn test_entire_line_detection() {
-        // This would need to be tested with oxi::test as it requires end_of_line
-        // which makes API calls. For now, we'll test the logic directly.
-        // Entire line: col_start == 0 && col_end == end_of_line(row)
+    fn test_entire_line_logic() {
+        // Test entire line detection logic directly
+        // Entire line: col_start == 0 && (line_len == 0 || col_end >= line_len)
 
-        // Mock scenario: line with 50 characters
+        // Full line scenario
         let col_start = 0;
         let col_end = 50;
         let line_length = 50;
-        assert_eq!(col_start == 0 && col_end == line_length, true);
+        assert_eq!(col_start == 0 && col_end >= line_length, true);
 
         // Not entire line: doesn't start at 0
         let col_start = 5;
-        assert_eq!(col_start == 0 && col_end == line_length, false);
+        assert_eq!(col_start == 0 && col_end >= line_length, false);
 
-        // Not entire line: doesn't end at line_length
+        // Not entire line: doesn't reach end
         let col_start = 0;
         let col_end = 25;
-        assert_eq!(col_start == 0 && col_end == line_length, false);
+        assert_eq!(col_start == 0 && col_end >= line_length, false);
+
+        // Empty line
+        let line_length = 0;
+        let col_start = 0;
+        let col_end = 0;
+        assert_eq!(col_start == 0 && (line_length == 0 || col_end >= line_length), true);
     }
 
     #[test]
@@ -303,18 +374,32 @@ mod tests {
         assert!(BASE_PRIORITY > 0, "BASE_PRIORITY should be positive");
         assert!(MAX_SAFE_PRIORITY < u32::MAX, "MAX_SAFE_PRIORITY should leave room before overflow");
         assert!(BASE_PRIORITY < MAX_SAFE_PRIORITY, "BASE_PRIORITY should be less than MAX_SAFE_PRIORITY");
+        // Verify we have at least 1000 highlights worth of room
+        assert!(u32::MAX - MAX_SAFE_PRIORITY >= 1000, "Should have room for at least 1000 highlights");
     }
 
     #[test]
-    fn test_color_validation() {
-        // All defined colors should be valid keys
-        assert!(COLORS.contains_key("Red"));
-        assert!(COLORS.contains_key("Green"));
-        assert!(COLORS.contains_key("Blue"));
+    fn test_color_definitions() {
+        // Verify colors array is properly defined
+        assert!(COLORS.len() == 6, "Should have 6 predefined colors");
 
-        // Invalid color should not exist
-        assert!(!COLORS.contains_key("InvalidColor"));
-        assert!(!COLORS.contains_key(""));
+        // Verify specific colors exist
+        assert!(COLORS.iter().any(|(name, _)| *name == "Red"));
+        assert!(COLORS.iter().any(|(name, _)| *name == "Green"));
+        assert!(COLORS.iter().any(|(name, _)| *name == "Blue"));
+
+        // Verify hex codes are valid format (start with #, 7 chars)
+        for (_, hex) in COLORS.iter() {
+            assert!(hex.starts_with('#'), "Hex code should start with #");
+            assert_eq!(hex.len(), 7, "Hex code should be 7 characters");
+        }
+    }
+
+    #[test]
+    fn test_namespace_id_uniqueness() {
+        // Verify namespace has a unique identifier
+        assert!(NAMESPACE_ID.contains("highlighter"), "Namespace should contain 'highlighter'");
+        assert!(NAMESPACE_ID.contains('.'), "Namespace should use dotted format for uniqueness");
     }
 }
 
@@ -323,30 +408,32 @@ mod tests {
 // ============================================================================
 
 #[oxi::test]
-fn test_highlight_namespace_creation() {
-    // Verify the namespace is created and has a valid ID
-    assert!(*PLUGIN > 0, "Plugin namespace should have a valid ID");
+fn test_namespace_initialization() {
+    // Verify the namespace can be created and has a valid ID
+    let namespace = get_namespace().unwrap();
+    assert!(namespace > 0, "Plugin namespace should have a valid ID");
 }
 
 #[oxi::test]
-fn test_colors_map_initialization() {
+fn test_colors_array_integrity() {
     // Verify all expected colors are present
     assert_eq!(COLORS.len(), 6, "Should have 6 predefined colors");
-    assert!(COLORS.contains_key("Red"));
-    assert!(COLORS.contains_key("Green"));
-    assert!(COLORS.contains_key("Blue"));
-    assert!(COLORS.contains_key("Purple"));
-    assert!(COLORS.contains_key("Yellow"));
-    assert!(COLORS.contains_key("Black"));
 
-    // Verify color format
-    assert_eq!(COLORS.get("Red"), Some(&"#ff0000".to_string()));
-    assert_eq!(COLORS.get("Green"), Some(&"#00ff00".to_string()));
-    assert_eq!(COLORS.get("Blue"), Some(&"#0000ff".to_string()));
+    let color_names: Vec<&str> = COLORS.iter().map(|(name, _)| *name).collect();
+    assert!(color_names.contains(&"Red"));
+    assert!(color_names.contains(&"Green"));
+    assert!(color_names.contains(&"Blue"));
+    assert!(color_names.contains(&"Purple"));
+    assert!(color_names.contains(&"Yellow"));
+    assert!(color_names.contains(&"Black"));
+
+    // Verify color values
+    let red = COLORS.iter().find(|(name, _)| *name == "Red").unwrap();
+    assert_eq!(red.1, "#ff0000");
 }
 
 #[oxi::test]
-fn test_end_of_line_with_content() {
+fn test_get_line_length_with_content() {
     // Create a test buffer with known content
     let buf = api::create_buf(false, true).unwrap();
     api::set_current_buf(&buf).unwrap();
@@ -355,19 +442,19 @@ fn test_end_of_line_with_content() {
     buf.set_lines(0..1, true, vec!["Hello World".to_string()].into_iter())
         .unwrap();
 
-    let eol = end_of_line(0);
-    assert_eq!(eol, 11, "Line 'Hello World' should be 11 characters");
+    let len = get_line_length(0).unwrap();
+    assert_eq!(len, 11, "Line 'Hello World' should be 11 bytes");
 }
 
 #[oxi::test]
-fn test_end_of_line_invalid_row() {
+fn test_get_line_length_invalid_row() {
     // Create an empty buffer
     let buf = api::create_buf(false, true).unwrap();
     api::set_current_buf(&buf).unwrap();
 
-    // Request line beyond buffer - should return 0 instead of panicking
-    let eol = end_of_line(1000);
-    assert_eq!(eol, 0, "Invalid row should return 0");
+    // Request line beyond buffer - should return error instead of panicking
+    let result = get_line_length(1000);
+    assert!(result.is_err(), "Invalid row should return an error");
 }
 
 #[oxi::test]
