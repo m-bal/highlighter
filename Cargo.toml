@@ -1,13 +1,15 @@
 [package]
 name = "highlighter"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
+authors = ["highlighter contributors"]
+description = "A Neovim plugin for visually highlighting text with colors"
+repository = "https://github.com/m-bal/highlighter"
+license = "MIT OR Apache-2.0"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-lazy_static = "1.4.0"
 mlua = { version = "0.8.8", features = ["luajit52"] }
 nvim-oxi = { version = "0.2.2", features = ["neovim-0-8", "test", "mlua"] }
